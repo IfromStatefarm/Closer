@@ -1,0 +1,263 @@
+/**
+ * The Closer: 24/7 Server-Side Edition (FloPirate Report AI)
+ * Logic: Runs via a 1-minute trigger. Checks up to 10 links per execution.
+ * Only targets rows where Column J (Status) is NOT "Resolved".
+ * * Target Mapping:
+ * - Column H (Index 7): Input URLs
+ * - Column J (Index 9): Output Status
+ * - Column V (Index 21): Resolve Date
+ * * Status Rules:
+ * - "Resolved": 100% of links in the cell are dead.
+ * - "Reported": Some links are dead, but at least 1 is still active.
+ * - "Open": 100% of links in the cell are active.
+ */
+
+const TARGET_TAB_NAME = 'Report Submissions and status';
+const STATUS_COL_INDEX = 9; // Column J (0-indexed)
+const URL_COL_INDEX = 7;    // Column H (0-indexed)
+const RESOLVE_DATE_COL = 22; // Column V (1-indexed for getRange)
+
+// Websites the bot should NEVER check (internal or common tools)
+const EXEMPT_WEBSITES = [
+  'varsity.com', 'flosports.tv', 'floracing.tv', 'milesplit.com', 
+  'houston.flosports.net', 'google.com', 'amazon.com', 'flocasts.atlassian.net',
+  'gemini.google.com', 'chatgpt.com', 'fso-heatmap.vercel.app', 'gmail.com', 
+  'app.slack.com', 'flosports.okta.com', 'workforcenow.adp.com', 'app.hibob.com', 
+  'drive.google.com'
+];
+
+/**
+ * Main entry point. 
+ * SET THIS TO RUN ON A 1-MINUTE TIME TRIGGER.
+ */
+function trigger247Closer() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  
+  // 1. Fetch the last processed row from memory
+  let lastProcessedRow = parseInt(scriptProperties.getProperty('LAST_ROW')) || 1;
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = findSheet(ss, TARGET_TAB_NAME);
+  
+  if (!sheet) {
+    console.error("Critical Error: Could not find the reporting tab.");
+    return;
+  }
+  
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return; // Empty sheet
+
+  // 2. Loop to check up to 10 rows per minute
+  for (let i = 0; i < 10; i++) {
+    // Increment the row counter
+    lastProcessedRow++;
+
+    // 3. AUTO-RESET LOGIC: If we hit the end, jump back to the start (Row 2)
+    if (lastProcessedRow > lastRow) {
+      console.log("Reached end of sheet. Resetting to top...");
+      lastProcessedRow = 2; 
+    }
+
+    // Check if the current row needs verification (Skip already Resolved rows)
+    const currentStatus = sheet.getRange(lastProcessedRow, STATUS_COL_INDEX + 1).getValue().toString().toLowerCase();
+    
+    if (currentStatus !== "resolved") {
+      processRow(sheet, lastProcessedRow);
+    } else {
+      // If the row was already resolved, we skip it but don't count it against our 10-link "active check" quota
+      // i--; // Optional: uncomment this to ensure 10 ACTUAL checks per minute regardless of skip volume
+    }
+
+    // 4. Save progress to memory after every row check
+    scriptProperties.setProperty('LAST_ROW', lastProcessedRow.toString());
+
+    // Delay 6 seconds per link to meet the 1-minute execution cycle
+    if (i < 9) Utilities.sleep(6000);
+  }
+}
+
+/**
+ * Robust helper to find the sheet using aliases or fallback to first tab.
+ */
+function findSheet(ss, primaryName) {
+  const sheets = ss.getSheets();
+  const aliases = [
+    primaryName.toLowerCase().trim(),
+    'sheet 1',
+    'sheet1',
+    'tab 1',
+    'tab1',
+    'report submissions and status'
+  ];
+  
+  let sheet = ss.getSheetByName(primaryName);
+  if (sheet) return sheet;
+  
+  sheet = sheets.find(s => {
+    const sName = s.getName().trim().toLowerCase();
+    return aliases.includes(sName);
+  });
+  
+  return sheet || sheets[0];
+}
+
+/**
+ * Logic to check links in Column H and update Column J based on active link counts
+ */
+function processRow(sheet, rowIndex) {
+  const rowData = sheet.getRange(rowIndex, 1, 1, 11).getValues()[0];
+  const cellValue = (rowData[URL_COL_INDEX] || "").toString();
+  
+  if (!cellValue.trim()) return;
+
+  // Regex to extract only valid URLs, filtering out random words or empty blocks
+  const urlRegex = /https?:\/\/[^\s,]+/g;
+  const urls = cellValue.match(urlRegex);
+
+  if (!urls || urls.length === 0) {
+    console.log(`Row ${rowIndex}: Cell contains text but no valid URLs.`);
+    return;
+  }
+
+  let deadCount = 0;
+  let activeCount = 0;
+
+  for (const url of urls) {
+    // Check if the site is in the exemption list
+    const isExempt = EXEMPT_WEBSITES.some(site => url.toLowerCase().includes(site));
+    if (isExempt) continue;
+
+    if (isUrlDown(url)) {
+      deadCount++;
+    } else {
+      activeCount++;
+    }
+  }
+
+  const statusRange = sheet.getRange(rowIndex, STATUS_COL_INDEX + 1); // Column J
+  const urlRange = sheet.getRange(rowIndex, URL_COL_INDEX + 1);       // Column H
+
+  // --- LOGIC GATES ---
+  
+  // 1. ALL DEAD -> Resolved (Column J)
+  if (activeCount === 0) {
+    statusRange.setValue("Resolved");
+    sheet.getRange(rowIndex, RESOLVE_DATE_COL).setValue(new Date()); // Column V
+    
+    // UI SNIPPET: Grey out AND Strike out Column H
+    urlRange.setFontLine("strikethrough")
+            .setFontColor("#999999");
+            
+    console.log(`Row ${rowIndex}: 100% dead. Marked Resolved & Formatted.`);
+  }  
+  // 2. MIXED -> Reported (Column J)
+  else if (deadCount > 0 && activeCount > 0) {
+    statusRange.setValue("Reported");
+    urlRange.setFontLine("none").setFontColor("#000000"); 
+    console.log(`Row ${rowIndex}: Mixed results. Marked Reported.`);
+  }
+  // 3. ALL ACTIVE -> Open (Column J)
+  else if (deadCount === 0) {
+    statusRange.setValue("Open");
+    urlRange.setFontLine("none").setFontColor("#000000");
+    console.log(`Row ${rowIndex}: 100% active. Marked Open.`);
+  }
+}
+
+/**
+ * Performs a headless fetch to see if the content is still live
+ */
+function isUrlDown(url) {
+  const EXEMPT = ['flosports.tv', 'varsity.com', 'milesplit.com', 'floracing.com', 'flowrestling.org'];
+  if (EXEMPT.some(site => url.toLowerCase().includes(site))) return false;
+
+  try {
+    const response = UrlFetchApp.fetch(url, { 
+      muteHttpExceptions: true, 
+      followRedirects: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }
+    });
+    
+    const code = response.getResponseCode();
+    const content = response.getContentText().toLowerCase();
+
+    if (code === 404 || code === 410) return true;
+
+    if (url.includes('tiktok.com')) {
+      if (content.includes("video currently unavailable") || 
+          content.includes("video not found") || 
+          content.includes("couldn't find this account")) return true;
+    }
+    if (plat === 'youtube') {
+                            // DOM-based error indicators (more reliable than text)
+                            if (document.querySelector('yt-player-error-message-renderer') || document.querySelector('ytd-video-error-message-renderer')) return resolve(true);
+
+                            if (text.includes("video unavailable")) return resolve(true);
+                            if (text.includes("video has been removed")) return resolve(true);
+                            if (text.includes("video is private")) return resolve(true);
+                            if (text.includes("this video is no longer available")) return resolve(true);
+                            if (text.includes("account has been terminated")) return resolve(true);
+                            if (text.includes("copyright claim by flosports")) return resolve(true);
+                            if (window.location.href === "https://www.youtube.com/") return resolve(true); 
+                            
+                            // Consent / Captcha blocker (Treat as active so user can investigate)
+                            if (text.includes("before you continue to youtube")) return resolve(false);
+
+                            // Strong positive indicators: Wait for the actual video metadata to render, not just the empty player shell
+                            if (document.querySelector('ytd-watch-metadata') || document.querySelector('ytd-video-primary-info-renderer')) {
+                                // Double check before closing to catch late-rendering error overlays
+                                setTimeout(() => {
+                                    const doubleCheckText = document.body.innerText.toLowerCase();
+                                    if (document.querySelector('yt-player-error-message-renderer') || 
+                                        document.querySelector('ytd-video-error-message-renderer') ||
+                                        doubleCheckText.includes("video unavailable") ||
+                                        doubleCheckText.includes("video has been removed") ||
+                                        doubleCheckText.includes("video is private") ||
+                                        doubleCheckText.includes("this video is no longer available") ||
+                                        doubleCheckText.includes("copyright claim")) {
+                                        resolve(true); // It's actually DOWN
+                                    } else {
+                                        resolve(false); // Verified ACTIVE
+                                    }
+                                }, 2500);
+                                return; // Stop the polling loop while we wait for the double check
+                            }
+                        }
+    // --- BULLETPROOF TWITTER / X LOGIC ---
+    if (url.includes('twitter.com') || url.includes('x.com')) {
+        // Signature 1: Standard "This page doesn't exist" title
+        if (contentLower.includes("<title>x / page not found</title>") || 
+            contentLower.includes("<title>twitter / page not found</title>")) return true;
+
+        // Signature 2: Suspended account indicator
+        if (contentLower.includes("account suspended") || 
+            contentLower.includes("suspended") && contentLower.includes("violates the x rules")) return true;
+
+        // Signature 3: Deleted Tweet indicator in JS data block
+        // Twitter often embeds the error state in a script tag like: {"errors":[{"code":144,"message":"No status found with that ID."}]}
+        if (content.includes('"code":144') || content.includes('"code":34')) return true;
+
+        // Signature 4: Search Engine Meta Robots (Often set to 'noindex' if tweet is gone)
+        if (contentLower.includes('content="noindex"') && contentLower.includes('tweet')) return true;
+        
+        // Failsafe: If it's a 200 OK but doesn't mention the tweet content and has the generic "Log in" screen,
+        // it's likely been restricted/deleted. However, to be safe, if we see "Explore" or "Trending", it's live.
+        if (contentLower.includes("this post has been deleted")) return true;
+    }
+    if (url.includes('instagram.com')) {
+        if (content.includes("sorry, this page isn't available") || content.includes("link you followed may be broken")) return true;
+    }
+
+    return false;
+  } catch (e) {
+    return false; 
+  }
+}
+
+/**
+ * Reset Tool: Run this manually if the bot gets stuck or you want to restart from the top.
+ */
+function resetCloserPosition() {
+  PropertiesService.getScriptProperties().setProperty('LAST_ROW', '1');
+  console.log("Closer position reset to Row 1.");
+}
